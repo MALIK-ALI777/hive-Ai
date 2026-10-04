@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv()
@@ -143,42 +143,57 @@ class EventRequest(BaseModel):
         raise ValueError("Date must be in YYYY-MM-DD format.")
 
 
-class ScheduleItem(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class LenientModel(BaseModel):
+    """Tolerates sloppy LLM JSON: extra keys, nulls, numbers where text is expected."""
+
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_nulls(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if v is not None}
+        return data
+
+
+class ScheduleItem(LenientModel):
     time: str = ""
     title: str
     description: str = ""
 
 
-class NamedItem(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class NamedItem(LenientModel):
     name: str
     description: str = ""
 
 
-class DeadlineItem(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class DeadlineItem(LenientModel):
     item: str
     due: str = ""
     owner: str = ""
 
 
-class PreparationTask(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class PreparationTask(LenientModel):
     task: str
     when: str = ""
     notes: str = ""
 
 
-class PrioritizedTask(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class PrioritizedTask(LenientModel):
     priority: int = 3
     task: str
     owner_role: str = ""
 
+    @field_validator("priority", mode="before")
+    @classmethod
+    def coerce_priority(cls, value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 3
 
-class PlanningOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+
+class PlanningOutput(LenientModel):
     schedule: list[ScheduleItem] = Field(default_factory=list)
     activities: list[NamedItem] = Field(default_factory=list)
     deadlines: list[DeadlineItem] = Field(default_factory=list)
@@ -186,8 +201,7 @@ class PlanningOutput(BaseModel):
     prioritized_checklist: list[PrioritizedTask] = Field(default_factory=list)
 
 
-class BudgetLineItem(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class BudgetLineItem(LenientModel):
     name: str
     estimated_amount: float = 0
     notes: str = ""
@@ -206,30 +220,57 @@ class BudgetLineItem(BaseModel):
         return float(match.group(0))
 
 
-class BudgetCategory(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class BudgetCategory(LenientModel):
     name: str
     items: list[BudgetLineItem] = Field(default_factory=list)
     notes: str = ""
 
 
-class BudgetOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class BudgetOutput(LenientModel):
     categories: list[BudgetCategory] = Field(default_factory=list)
     cost_saving_suggestions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
-class LogisticsEntry(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class LogisticsEntry(LenientModel):
     item: str
     detail: str = ""
     assumption: bool = False
     assumption_note: str = ""
 
 
-class LogisticsOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class LogisticsOutput(LenientModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_lists(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, (dict, str)):
+                value = [value]
+            if isinstance(value, list):
+                fixed: list[Any] = []
+                for entry in value:
+                    if isinstance(entry, str):
+                        fixed.append({"item": entry})
+                    elif isinstance(entry, dict):
+                        entry = dict(entry)
+                        if not entry.get("item"):
+                            entry["item"] = str(
+                                entry.get("name")
+                                or entry.get("title")
+                                or entry.get("detail")
+                                or entry.get("description")
+                                or "Item"
+                            )
+                        fixed.append(entry)
+                value = fixed
+            out[key] = value
+        return out
+
     venue_requirements: list[LogisticsEntry] = Field(default_factory=list)
     seating_and_capacity: list[LogisticsEntry] = Field(default_factory=list)
     equipment: list[LogisticsEntry] = Field(default_factory=list)
@@ -240,8 +281,7 @@ class LogisticsOutput(BaseModel):
     event_day_operations: list[LogisticsEntry] = Field(default_factory=list)
 
 
-class ManagerBriefs(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class ManagerBriefs(LenientModel):
     understood_request: str = ""
     extracted_requirements: dict[str, Any] = Field(default_factory=dict)
     planning_brief: str
@@ -250,8 +290,7 @@ class ManagerBriefs(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
 
 
-class FinalPlanOutput(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class FinalPlanOutput(LenientModel):
     event_title: str = ""
     executive_summary: str = ""
     coordination_summary: str = ""
@@ -962,7 +1001,12 @@ def _public_error(exc: Exception) -> str:
     if isinstance(exc, RuntimeError):
         return str(exc)
     if isinstance(exc, ValidationError):
-        return "An agent returned invalid structured data."
+        try:
+            first = exc.errors()[0]
+            where = ".".join(str(part) for part in first.get("loc", ()))
+            return f"An agent returned invalid structured data ({where}: {first.get('msg')})."
+        except Exception:
+            return "An agent returned invalid structured data."
     logger.debug("Internal error detail: %s", traceback.format_exc())
     return "An unexpected error occurred while contacting the AI provider."
 
