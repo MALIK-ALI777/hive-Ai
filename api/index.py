@@ -472,6 +472,7 @@ class GrokClient:
         user_prompt: str,
         temperature: float,
         timeout: float | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         if not api_key_configured():
             raise RuntimeError(
@@ -485,7 +486,7 @@ class GrokClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": temperature,
-            "max_completion_tokens": MAX_OUTPUT_TOKENS,
+            "max_completion_tokens": max_tokens or MAX_OUTPUT_TOKENS,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -504,7 +505,8 @@ class GrokClient:
         )
 
         response: httpx.Response | None = None
-        for attempt in range(MAX_RETRIES + 1):
+        json_retries = 0
+        for attempt in range(MAX_RETRIES + 3):
             async with self._gate:  # only N calls in flight at once
                 async with httpx.AsyncClient(timeout=client_timeout) as client:
                     try:
@@ -516,12 +518,25 @@ class GrokClient:
                             "Could not reach the AI API. Check GROK_API_BASE and your network connection."
                         ) from exc
 
+            if (
+                response.status_code == 400
+                and "json" in _safe_error_body(response).lower()
+                and json_retries < 2
+            ):
+                # Provider's JSON mode choked (usually truncated output). Retry with a
+                # bigger budget and without strict JSON mode; extract_json_object() cleans it.
+                json_retries += 1
+                payload.pop("response_format", None)
+                payload["max_completion_tokens"] = int(payload["max_completion_tokens"] * 1.5)
+                logger.warning("JSON generation failed, retry %d without strict JSON mode", json_retries)
+                continue
+
             if response.status_code != 429:
                 break
 
             wait = _retry_wait_seconds(response)
             # Long wait = daily limit; retrying won't help, so show the real message.
-            if attempt == MAX_RETRIES or wait > 30:
+            if attempt >= MAX_RETRIES or wait > 30:
                 raise RuntimeError(f"Rate limit reached: {_safe_error_body(response)}")
             logger.warning("429 from provider, retrying in %.1fs (attempt %d)", wait, attempt + 1)
             await asyncio.sleep(wait)
@@ -775,12 +790,15 @@ class LogisticsAgent:
             '  "setup_checklist": [{"item": "", "detail": "", "assumption": false, "assumption_note": ""}],\n'
             '  "event_day_operations": [{"item": "", "detail": "", "assumption": false, "assumption_note": ""}]\n'
             "}\n"
-            "Do not claim the venue capacity is confirmed unless the user stated it."
+            "Do not claim the venue capacity is confirmed unless the user stated it. "
+            "Be concise: at most 4 entries per list, each detail under 20 words, "
+            "assumption_note only when assumption is true."
         )
         data = await self.client.complete_json(
             system_prompt=system,
             user_prompt=user,
             temperature=0.35,
+            max_tokens=4500,
         )
         return LogisticsOutput.model_validate(data)
 
