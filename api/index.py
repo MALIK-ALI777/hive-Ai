@@ -2,7 +2,7 @@
 EventHive AI — FastAPI backend with genuine multi-agent orchestration.
 
 Workflow:
-  User request → Event Manager (briefs) → Planning / Budget / Logistics in parallel
+  User request → Event Manager (briefs) → Planning / Budget / Logistics
   → Python validation + budget reconciliation → Event Manager (final plan)
 """
 
@@ -15,7 +15,7 @@ import os
 import re
 import traceback
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
@@ -27,8 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv()
-# On Vercel, environment variables are injected directly (set in Project
-# Settings → Environment Variables) — the .env file is only for local runs.
+# On Vercel, environment variables are injected directly (Project Settings →
+# Environment Variables). The .env file is only for local runs.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,13 +36,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger("eventhive")
 
-GROK_API_KEY = (os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY") or "").strip()
-GROK_API_BASE = (os.getenv("GROK_API_BASE") or "https://api.x.ai/v1").rstrip("/")
-GROK_MODEL = (os.getenv("GROK_MODEL") or "grok-4-fast").strip()
-AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS") or "90")
-ORCHESTRATION_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATION_TIMEOUT_SECONDS") or "240")
+# ---------------------------------------------------------------------------
+# Provider configuration (Groq by default, tolerant of messy env vars)
+# ---------------------------------------------------------------------------
 
 PLACEHOLDER_KEYS = {"", "your_actual_api_key", "changeme", "replace_me"}
+
+DEFAULT_BASE = "https://api.groq.com/openai/v1"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+RETIRED_MODELS = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant"}
+
+
+def _pick_api_key() -> str:
+    """First real key found under any of the likely variable names."""
+    names = (
+        "GROK_API_KEY",
+        "GROQ_API_KEY",
+        "Grok_API_key",
+        "Groq_API_Key",
+        "XAI_API_KEY",
+    )
+    for name in names:
+        value = (os.getenv(name) or "").strip()
+        if value and value.lower() not in PLACEHOLDER_KEYS:
+            return value
+    return ""
+
+
+def _pick_base() -> str:
+    raw = (os.getenv("GROK_API_BASE") or "").strip().rstrip("/")
+    if not raw or "api.x.ai" in raw:
+        return DEFAULT_BASE
+    return raw
+
+
+def _pick_model() -> str:
+    raw = (os.getenv("GROK_MODEL") or "").strip()
+    if not raw or raw.lower().startswith("grok") or raw in RETIRED_MODELS:
+        return DEFAULT_MODEL
+    return raw
+
+
+GROK_API_KEY = _pick_api_key()
+GROK_API_BASE = _pick_base()
+GROK_MODEL = _pick_model()
+
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS") or "90")
+ORCHESTRATION_TIMEOUT_SECONDS = float(os.getenv("ORCHESTRATION_TIMEOUT_SECONDS") or "240")
+MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS") or "1")
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS") or "3000")
+MAX_RETRIES = 3
 
 
 def api_key_configured() -> bool:
@@ -357,8 +400,18 @@ def event_brief(event: EventRequest) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Grok HTTP client
+# LLM HTTP client (OpenAI-compatible: Groq by default)
 # ---------------------------------------------------------------------------
+
+
+def _retry_wait_seconds(response: httpx.Response) -> float:
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return float(header) + 0.5
+        except ValueError:
+            pass
+    return 5.0
 
 
 class GrokClient:
@@ -371,6 +424,7 @@ class GrokClient:
             write=15.0,
             pool=15.0,
         )
+        self._gate = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
 
     async def complete_json(
         self,
@@ -389,15 +443,19 @@ class GrokClient:
             "Authorization": f"Bearer {GROK_API_KEY}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "temperature": temperature,
+            "max_completion_tokens": MAX_OUTPUT_TOKENS,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {"type": "json_object"},
         }
+        if "gpt-oss" in self.model:
+            payload["reasoning_effort"] = "low"  # less hidden thinking = fewer tokens
+
         url = f"{self.base_url}/chat/completions"
         client_timeout = httpx.Timeout(
             connect=15.0,
@@ -406,28 +464,40 @@ class GrokClient:
             pool=15.0,
         )
 
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            try:
-                response = await client.post(url, headers=headers, json=payload)
-            except httpx.TimeoutException as exc:
-                raise TimeoutError("The Grok API request timed out.") from exc
-            except httpx.RequestError as exc:
-                raise RuntimeError(
-                    "Could not reach the Grok API. Check GROK_API_BASE and your network connection."
-                ) from exc
+        response: httpx.Response | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            async with self._gate:  # only N calls in flight at once
+                async with httpx.AsyncClient(timeout=client_timeout) as client:
+                    try:
+                        response = await client.post(url, headers=headers, json=payload)
+                    except httpx.TimeoutException as exc:
+                        raise TimeoutError("The AI request timed out.") from exc
+                    except httpx.RequestError as exc:
+                        raise RuntimeError(
+                            "Could not reach the AI API. Check GROK_API_BASE and your network connection."
+                        ) from exc
 
+            if response.status_code != 429:
+                break
+
+            wait = _retry_wait_seconds(response)
+            # Long wait = daily limit; retrying won't help, so show the real message.
+            if attempt == MAX_RETRIES or wait > 30:
+                raise RuntimeError(f"Rate limit reached: {_safe_error_body(response)}")
+            logger.warning("429 from provider, retrying in %.1fs (attempt %d)", wait, attempt + 1)
+            await asyncio.sleep(wait)
+
+        assert response is not None
         if response.status_code == 401:
-            raise RuntimeError("Grok API authentication failed. Check GROK_API_KEY.")
-        if response.status_code == 429:
-            raise RuntimeError("Grok API rate limit reached. Wait a moment and retry.")
+            raise RuntimeError("AI API authentication failed. Check your API key.")
         if response.status_code >= 400:
             detail = _safe_error_body(response)
-            raise RuntimeError(f"Grok API error ({response.status_code}): {detail}")
+            raise RuntimeError(f"AI API error ({response.status_code}): {detail}")
 
         try:
             body = response.json()
         except json.JSONDecodeError as exc:
-            raise RuntimeError("Grok API returned a non-JSON response.") from exc
+            raise RuntimeError("AI API returned a non-JSON response.") from exc
 
         content = _message_content(body)
         try:
@@ -441,7 +511,7 @@ class GrokClient:
 def _message_content(body: dict[str, Any]) -> str:
     choices = body.get("choices") or []
     if not choices:
-        raise RuntimeError("Grok API returned no choices.")
+        raise RuntimeError("AI API returned no choices.")
     message = choices[0].get("message") or {}
     content = message.get("content")
     if isinstance(content, list):
@@ -453,7 +523,7 @@ def _message_content(body: dict[str, Any]) -> str:
                 parts.append(part)
         content = "".join(parts)
     if not isinstance(content, str):
-        raise RuntimeError("Grok API response did not include text content.")
+        raise RuntimeError("AI API response did not include text content.")
     return content
 
 
@@ -978,8 +1048,8 @@ async def health() -> dict[str, Any]:
         "setup_message": None
         if configured
         else (
-            "GROK_API_KEY is not configured. Add it to the backend .env file for local use, "
-            "or set it as an environment variable on your host (Render). Never put the key in frontend code."
+            "No API key found. Add GROK_API_KEY (your Groq key) in the Vercel environment variables "
+            "or the local .env file. Never put the key in frontend code."
         ),
         "time": datetime.now(timezone.utc).isoformat(),
     }
